@@ -298,7 +298,215 @@ type part struct {
 }
 ```
 
-**边界**：查询时按 TSID 找 block，再读 timestamps/values（本篇不展开读路径）。
+### 6.2 两层索引：metaindex 粗筛 → index 精定位
+
+样本 part 里，`metaindex.bin` 和 `index.bin` 是**配套的两层索引**：前者在内存里整表加载、按 TSID 排序做**粗粒度**跳转；后者按需从磁盘读**压缩 index block**，里面是精确的 **block header** 列表。
+
+**和 IndexDB 的区别**：IndexDB part 也走 mergeset，目录里同样有四文件，但 payload 是 **`items.bin` / `lens.bin`**（sorted KV），**没有** timestamps/values——四文件分工见 [第 5 篇 §5](./05-indexdb-write-path.md#5-indexdb-part-磁盘布局mergeset-四文件)。下文只讨论 **sample part**（`small/` / `big/`）。
+
+#### 写入时如何生成
+
+`blockStreamWriter.WriteExternalBlock` 每写一个 block，就把 `blockHeader` 追加进内存里的 `indexData`，并更新当前 `metaindexRow` 的统计字段：
+
+```152:156:lib/storage/block_stream_writer.go
+	if len(bsw.indexData)+len(headerData) > maxBlockSize {
+		bsw.flushIndexData()
+	}
+	bsw.indexData = append(bsw.indexData, headerData...)
+	bsw.mr.RegisterBlockHeader(&b.bh)
+```
+
+当 `indexData` 累积超过 `maxBlockSize`（约 64 KiB 未压缩数据），或 part 关闭时，`flushIndexData` 会：
+
+1. 把 `indexData` **ZSTD 压缩**后追加写入 **`index.bin`**，记下 offset / size；
+2. 把对应的 **`metaindexRow`** 序列化追加进 `metaindexData`；
+3. 重置 `indexData`，开始下一个 index block。
+
+part 写完后，`metaindexData` 整体 ZSTD 压缩，写入 **`metaindex.bin`**。
+
+#### 各层存什么
+
+**`metaindexRow`**（`metaindex.bin` 解压后是一串按 TSID 排序的 row）：
+
+```11:33:lib/storage/metaindex_row.go
+// metaindexRow is a single metaindex row.
+//
+// The row points to a single index block containing block headers.
+type metaindexRow struct {
+	// TSID is the first TSID in the corresponding index block.
+	TSID TSID
+	MinTimestamp int64
+	MaxTimestamp int64
+	IndexBlockOffset uint64
+	BlockHeadersCount uint32
+	IndexBlockSize uint32
+}
+```
+
+| 字段 | 含义 |
+|------|------|
+| `TSID` | 该 index block 内**第一个** block header 的 TSID（不是上界） |
+| `MinTimestamp` / `MaxTimestamp` | index block 内所有 header 的时间并集 |
+| `IndexBlockOffset` / `IndexBlockSize` | 在 **`index.bin`** 里的压缩块位置 |
+| `BlockHeadersCount` | index block 里有多少个 block header |
+
+**`blockHeader`**（`index.bin` 里每个压缩 index block 解压后是一串按 TSID 排序的 header）：
+
+| 字段 | 含义 |
+|------|------|
+| `TSID` | 这条 series 的 block |
+| `MinTimestamp` / `MaxTimestamp` | 该 block 内样本时间范围 |
+| `TimestampsBlockOffset` / `ValuesBlockOffset` | 在 **`timestamps.bin` / `values.bin`** 里的压缩块位置 |
+| `TimestampsBlockSize` / `ValuesBlockSize` | 对应压缩块大小 |
+| `RowsCount`、`FirstValue`、编码类型等 | 读 block 时解压/解码用 |
+
+查询侧把 index block 读进 `indexBlock{ bhs []blockHeader }`（`part.go`），再在 header 列表上做 TSID + 时间匹配——见 [第 7 篇 §5.3](./07-query-part-block-pruning.md#53-partsearch三层跳过)。
+
+#### 示例：`2026_01` 一个 small part 里两个 `.bin` 存什么
+
+下面用本系列 7 个点写入后、真实 flush 出来的 part（`small/2026_01/18B328B55FFC968F/`）说明。**磁盘上是 ZSTD 压缩字节**；表里写的是 **解压后的逻辑内容**（便于对照字段含义）。
+
+**先建立 MetricID 与 series 的对应**（三条 series → 三个 `MetricID`，见 [第 2 篇](./02-vmstorage-addrows-tsid.md)）：
+
+| Series | 逻辑 block 名 | `MetricID`（十进制，截断显示） |
+|--------|---------------|-------------------------------|
+| S1 `cpu_usage{host="h1",…}` | B1 | `1779811012211904048` |
+| S2 `cpu_usage{host="h2",…}` | B2 | `1779811012211904049` |
+| S3 `http_requests_total{…}` | B3 | `1779811012211904050` |
+
+该 part 目录在磁盘上大致是：
+
+```text
+small/2026_01/18B328B55FFC968F/
+├── metaindex.bin     65 B   ← 解压后：1 行 metaindexRow
+├── index.bin        199 B   ← 解压后：3 个 blockHeader（再 ZSTD 压回去存盘）
+├── timestamps.bin     9 B   ← 3 段压缩时间戳列（每 block 一段）
+├── values.bin         3 B   ← 3 段压缩值列
+└── metadata.json          ← {"RowsCount":6,"BlocksCount":3,...}
+```
+
+##### 第 1 层：`metaindex.bin` 解压后只有 1 行
+
+本示例 3 个 block header 合计远小于 `maxBlockSize`，**整 part 只有 1 个 index block**，因此 metaindex 也只有 **1 行**——它是对整个 `index.bin` 的「目录项」：
+
+| 字段 | 本 part 的实际值 | 怎么读 |
+|------|------------------|--------|
+| `TSID.MetricID` | `…4049`（**S2**） | index block 里**按 TSID 排序后的第一个** header 是 S2，不是「只索引 S2」 |
+| `MinTimestamp` | `1768471200000` | index block 内 3 个 header 的最早时间（#1/#3/#5 的 10:00:00） |
+| `MaxTimestamp` | `1768471320000` | index block 内最晚时间（#4 的 10:02:00） |
+| `IndexBlockOffset` | `0` | 从 `index.bin` 文件头读 |
+| `IndexBlockSize` | `199` | 读 199 字节 → ZSTD 解压 → 得到 3 个 header |
+| `BlockHeadersCount` | `3` | 解压后应有 3 条 blockHeader |
+
+可以把它理解成一张**粗粒度卡片**：
+
+```text
+metaindex.bin（逻辑视图，1 行）
+┌──────────────────────────────────────────────────────────────┐
+│ TSID 起点=…4049(S2)  时间=[10:00:00 … 10:02:00]  共 3 个 block │
+│ → index.bin 偏移 0，长度 199 B                                │
+└──────────────────────────────────────────────────────────────┘
+```
+
+查询时若整个 index block 的 `MaxTimestamp` 早于查询窗口，**整 199 B 都不用读**；若在窗口内，才 `ReadAt(0, 199)` 读这一坨压缩数据。
+
+##### 第 2 层：`index.bin` 解压后是 3 条 blockHeader
+
+对 `index.bin` 做 `ReadAt(0, 199)` 并 ZSTD 解压后，得到按 **`MetricID` 升序**排列的 3 条 header（注意顺序与 flush 写入顺序无关）：
+
+| 顺序 | Series | `MetricID` | 时间范围（ms） | 样本 | `RowsCount` | `FirstValue`* | `TimestampsBlockOffset` | `ValuesBlockOffset` |
+|------|--------|------------|----------------|------|-------------|---------------|-------------------------|---------------------|
+| 1 | **S2** | …4049 | 10:00～10:02 | #3, #4 | 2 | `81` | `0` | `0` |
+| 2 | **S1** | …4048 | 10:00～10:01 | #1, #2 | 2 | `72` | `3` | `1` |
+| 3 | **S3** | …4050 | 10:00～10:01:30 | #5, #6 | 2 | `1200` | `6` | `2` |
+
+\* `FirstValue` 是 VM 内部的 decimal 整数形式：`72` 表示 `0.72`，`81` 表示 `0.81`；counter 的 `1200` 则与样本值一致。
+
+每条 header 还带有 `TimestampsBlockSize=3`、`ValuesBlockSize=1`（本 part 每 block 只有 2 个点，压缩后极小）。**精定位**就靠这些 offset/size 去 `timestamps.bin` / `values.bin` 里 `ReadAt`：
+
+```text
+index.bin 解压后（逻辑视图，3 条 header）
+┌─ header S2 ── ts@0  val@0  ── #3(0.81), #4(0.79)
+├─ header S1 ── ts@3  val@1  ── #1(0.72), #2(0.75)
+└─ header S3 ── ts@6  val@2  ── #5(1200), #6(1248)
+         │              │
+         └──────┬───────┘
+                ▼
+     timestamps.bin (9 B)    values.bin (3 B)
+     [S2列][S1列][S3列]       [S2][S1][S3]
+```
+
+##### 串起来：查 `cpu_usage{host="h1"}` 时两层索引怎么用
+
+IndexDB 阶段已把 TSID 白名单缩成 **[S1 / …4048]**（见 [第 6 篇](./06-query-indexdb-series-pruning.md)）。进入 `2026_01` 的 part 后：
+
+1. **metaindex 行**：时间 `[10:00, 10:02]` 与查询窗口重叠 → 读 `index.bin[0:199]`。
+2. **index block 内**：3 条 header 按 TSID 排序；`partSearch` 二分/线性跳过 **S2（…4049）**、**S3（…4050）**，只匹配 **S1（…4048）** 那条 header。
+3. **读数据**：用 S1 header 的 `TimestampsBlockOffset=3`、`ValuesBlockOffset=1` 读两列压缩块，解压后在内存里再按查询窗口裁 #1、#2（阶段 5）。
+
+```text
+查询 cpu_usage{host="h1"}  @ 2026-01-15
+
+  metaindex[0]  ──时间 OK──►  index.bin[0:199]
+                                    │
+                    ┌───────────────┼───────────────┐
+                    ▼               ▼               ▼
+                 header S2       header S1       header S3
+                 …4049 ✗        …4048 ✓         …4050 ✗
+                                    │
+                                    ▼
+                          ts.bin[3:6] + val.bin[1:2]
+                                    │
+                                    ▼
+                          样本 #1=0.72, #2=0.75
+```
+
+##### 对比：`2026_02` 更简单
+
+#7 单独落在 `2026_02` partition，该 part **1 block / 1 row**：
+
+| 文件 | 逻辑内容 |
+|------|----------|
+| `metaindex.bin` | 1 行：`MetricID=…4048(S1)`，时间 `1770105600000`～`1770105600000`，`BlockHeadersCount=1` |
+| `index.bin` | 1 个 index block → 1 条 header → 指向 #7 的 `0.65` |
+
+两层结构相同，只是每一层都只有 **1 项**。
+
+##### part 变大时：metaindex 会出现多行
+
+当 `indexData` 累积超过 `maxBlockSize`（约 64 KiB 未压缩 header 数据），`flushIndexData` 会把当前 index block 写入 `index.bin` 并**追加一行 metaindex**，然后清空 `indexData` 继续写。假设某 part 被拆成 2 个 index block，逻辑上会变成：
+
+| metaindex 行 | `TSID` 起点 | 时间范围 | `IndexBlockOffset` | `BlockHeadersCount` |
+|--------------|-------------|----------|--------------------|---------------------|
+| row 0 | …100 | `[T₀ … T₁]` | `0` | 5000 |
+| row 1 | …9000 | `[T₂ … T₃]` | `8192` | 4800 |
+
+查询 `MetricID=…5000` 时，metaindex 二分落在 row 0，**只读** `index.bin[0:…]`；row 1 整段跳过——这就是「粗筛」省下来的磁盘 IO。
+
+#### 本系列小结
+
+`2026_01` 的 small part：**1 行 metaindex → 1 个 index block → 3 条 blockHeader → 3 段 timestamps/values**。part 变大后变为 **多行 metaindex + 多个 index block**；查询先用 metaindex 跳过整段，再只对候选 index block 做 `ReadAt` + 解压。
+
+```mermaid
+flowchart TB
+  subgraph Query["查询路径（粗 → 细）"]
+    MR["metaindex.bin\n按 TSID 排序，part 打开时全量进内存"]
+    IB["index.bin\n按 offset 读压缩 index block"]
+    BH["blockHeader 列表\nTSID + 时间 + 数据偏移"]
+    DATA["timestamps.bin / values.bin"]
+    MR -->|"时间/TSID 粗筛\n跳过整段 index block"| IB
+    IB -->|"解压 + 二分"| BH
+    BH -->|"精确 offset"| DATA
+  end
+
+  subgraph Write["写入路径（细 → 粗）"]
+    W1["每写一个 block → append blockHeader 到 indexData"]
+    W2["indexData 过大 → flush 到 index.bin\n写一行 metaindexRow"]
+    W1 --> W2
+  end
+```
+
+**边界**：本篇只说明**磁盘上两层索引各自指向什么**；查询时 `partSearch` 如何遍历 metaindex、缓存 index block、跳过 S2/S3，见 [第 7 篇](./07-query-part-block-pruning.md)。
 
 ---
 
