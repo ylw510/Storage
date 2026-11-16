@@ -3,9 +3,23 @@
 > **目录**：[README.md](./README.md)
 > **图表**：图 1 到图 6 用 [Mermaid](https://mermaid.js.org/) 画在对应段落旁边。GitHub 直接打开本文件即可渲染。这些图是规划步骤的示意图，不是 `EXPLAIN` 原文。
 
-两张大表做等值 JOIN 时，每个执行任务不需要看见另一张表的全部行。打开 `make_distributed_plan` 之后，ClickHouse 可以把左右两侧按 join key 散列进同一组 bucket：key 相同的行进入同一个 bucket，每个 bucket 只用自己的那一份做哈希表的 build 和 probe，JOIN 结果再汇合，或者被下一个算子按另一组 key 重新划分。
+## 分布式 JOIN 有哪几条路
 
-这条路径默认是关的。`make_distributed_plan` 在 `src/Core/Settings.cpp` 里是 private preview，默认 `false`。不打开它，查询仍走单机计划。没有等值条件、写成 `LOCAL JOIN`、或者规划器选择把右表整份复制时，行也不会按 join key 重新分桶。
+打开 `make_distributed_plan` 之后，一个 JOIN 可以走几条不同的路。规划器选哪一条，看的是有没有等值键、右表估计有多大、JOIN 的 kind，以及当前是规则规划器还是 Cascades。步骤描述里能对上的三条是 `Shuffle HashJoin`、`Broadcast HashJoin` 和 `Local HashJoin`。本文后面只把第一条拆开讲。
+
+这条开关默认是关的。`make_distributed_plan` 在 `src/Core/Settings.cpp` 里是 private preview，默认 `false`。不打开它，查询仍是单机计划，下表里的划分和复制都不会发生。
+
+| 规划器里的路 | 适用场景 | 数据怎么放 |
+| --- | --- | --- |
+| shuffle | 有等值键，两侧要按同一把 key 分开处理。规则规划器：右表估计缺失，或者估计行数超过 `distributed_plan_max_rows_to_broadcast`（默认 20000），就留在这条；kind 是 `Right` 或 `Full` 时也留在这条。Cascades：节点数大于 1，`join_algorithm` 允许 `hash`、`grace_hash` 或 `auto`，并且代价比较胜出。 | 左右两侧按 join key 进入同一组 bucket。每个 bucket 只用自己的那一份做哈希表的 build 和 probe。 |
+| broadcast | 右表小到可以整份复制。规则规划器：谓词里已经有等值键，右表估计行数存在且不超过 `distributed_plan_max_rows_to_broadcast`，kind 不是 `Right` 也不是 `Full`。Cascades：左侧重写后仍保留时才发这条备选，`joinPreservesLeftSide` 对 `Inner`、`Left`、`Cross`、`Comma` 返回真。 | 右表复制到每个 bucket。左表不按 join key 散列，fragment 里打印成 `any`。 |
+| 单机 | JOIN 不拆到多个节点。规则规划器：没有等值键（`CROSS JOIN`、纯不等式）、等值键没有公共超类型，或写成 `LOCAL JOIN`，函数在插入 exchange 之前 return。Cascades 总会生成 `Local HashJoin`；集群只有一个节点，或 `join_algorithm` 不允许上面的 hash 家族时，只留下这一条。 | 两侧先汇到一个节点，再做普通 JOIN。 |
+
+两个关键字不在上表里占一行。`LOCAL JOIN` 把 locality 设成 `JoinLocality::Local`，意思是只用同一批服务器上已经有的数据：规则规划器在 `tryMakeDistributedJoin` 开头直接 return，Cascades 在 `getReasonCascadesCannotDistribute` 里拒绝整条计划。`GLOBAL JOIN` 只把 locality 设成 `JoinLocality::Global`。`tryMakeDistributedJoin` 允许 `Unspecified` 和 `Global` 进入后面的选择，走 shuffle 还是 broadcast 仍由行数估计或代价决定。
+
+还有一种不算新的 JOIN 种类。Cascades 里，子计划的分布已经满足父节点对 key 的要求时，`DistributionEnforcer` 不再插入 exchange。`node_count`、key 的顺序、`hash_type_names` 都要一致。规则规划器没有这道检查。
+
+两张大表做等值 JOIN、而且规划器选了 shuffle 时，每个执行任务不需要看见另一张表的全部行。左右两侧按 join key 散列进同一组 bucket：key 相同的行进入同一个 bucket，每个 bucket 只用自己的那一份做哈希表的 build 和 probe，JOIN 结果再汇合，或者被下一个算子按另一组 key 重新划分。
 
 源码里没有叫 shuffle join 的 SQL 语法，也没有名为 `ShuffleJoin` 的步骤。社区说的 shuffle join，就是上面这段数据移动。Cascades 给它的策略名是 `Shuffle HashJoin`。规则规划器在代码里把它写成枚举值 `Shuffle`。真正搬数据的步骤，切开计划之后叫 `ShuffleSend` 和 `ShuffleReceive`。
 
@@ -19,7 +33,7 @@
 
 ## 源码里的五个名字
 
-读计划之前先把五个名字分开。图 2 把 shuffle 和 broadcast 的树并排放着，下面这张表是同一件事的索引。
+开篇那张表按适用场景分过类。读计划之前还要把名字对上。图 2 把 shuffle 和 broadcast 的树并排放着，下面这张表是源码名字的索引。
 
 **图 2.** shuffle 与 broadcast 的计划形状。左侧两侧都按 join key 划分；右侧右表整份复制，左表是无 key 的 scatter。
 

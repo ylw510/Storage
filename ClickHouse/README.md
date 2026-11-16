@@ -6,7 +6,7 @@
 
 | 篇 | 文件 | 边界 |
 |----|------|------|
-| **1** | [分布式 JOIN：等值键如何被送进同一个 bucket](./01-distributed-shuffle-join.md) | `make_distributed_plan` 打开之后的 shuffle：规则规划器、Cascades、`ShuffleExchange` 切开成 `ShuffleSend` / `ShuffleReceive` |
+| **1** | [分布式 JOIN：等值键如何被送进同一个 bucket](./01-distributed-shuffle-join.md) | 先对照 shuffle、broadcast、单机三条路的适用场景，再展开 `make_distributed_plan` 下的 shuffle：规则规划器、Cascades、`ShuffleExchange` 切开成 `ShuffleSend` / `ShuffleReceive` |
 
 ### 推荐阅读
 
