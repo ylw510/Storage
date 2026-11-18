@@ -1,0 +1,103 @@
+---
+title: Needle、Chunk 与 Fid
+description: Volume 数据单元 vs Filer 索引单元；写入与读取完整示例
+sidebarTitle: 02 Needle / Chunk / Fid
+---
+
+# Needle、Chunk 与 Fid
+
+> **阅读目标**：Chunk 是 Filer 侧索引/组装单元；Needle 是 Volume 侧数据单元；Fid 把二者连起来。
+
+---
+
+## 1. 一句话区分
+
+| | **Needle** | **Chunk (`FileChunk`)** |
+|--|------------|-------------------------|
+| 在哪 | Volume（`.dat` + needle map） | Filer `Entry.Chunks[]` |
+| 是什么 | 真实字节（结构体里有 `Data []byte`） | `offset + size + file_id`，无业务 Data |
+| 类比 | 货架上的货 | 出库单上的一行 |
+
+一对一很常见，但生命周期可脱钩（Multipart Complete 后多个 Entry 可引用同一批 Needle；只删元数据时 Needle 仍在）。
+
+Volume 还有自己的 **`.idx`（needle map）**：那是「needleId → 文件偏移」，不要和 Filer 的 Chunk 混为一谈。
+
+---
+
+## 2. 内存结构：Needle
+
+源码：`weed/storage/needle/needle.go`
+
+```go
+type Needle struct {
+	Cookie Cookie
+	Id     NeedleId
+	Size   Size
+	DataSize uint32
+	Data     []byte  // 内存中的真实载荷
+	Flags    byte
+	Name / Mime / Pairs ...
+	Checksum CRC
+	AppendAtNs uint64
+	Padding []byte
+}
+```
+
+## 3. 元数据结构：FileChunk
+
+源码：`weed/pb/filer.proto`
+
+```protobuf
+message FileChunk {
+    string file_id = 1;
+    int64 offset = 2;
+    uint64 size = 3;
+    FileId fid = 7;
+    // cipher / sse / manifest ...
+}
+```
+
+`GetFileIdString()` 把 `Fid` 转成与 Needle 相同的 `volumeId,hex(needleId||cookie)` 字符串。
+
+## 4. Fid
+
+源码：`weed/storage/needle/file_id.go`、`weed/topology/topology.go`
+
+```text
+fid = volumeId + "," + hex(needleId || cookie)
+    = NewFileId(vid, Sequence.NextFileId(), rand.Uint32()).String()
+```
+
+---
+
+## 5. 完整示例：写/读 20MiB（chunkSize=8MiB）
+
+### 写入
+
+```text
+20MiB body
+  ├─ 8MiB → Assign → fid 3,016a01 → POST volume → Needle A → Chunk{off=0,size=8M,fid=...}
+  ├─ 8MiB → Assign → fid 3,016a02 → POST volume → Needle B → Chunk{off=8M,...}
+  └─ 4MiB → Assign → fid 5,01bc03 → POST volume → Needle C → Chunk{off=16M,...}
+
+Filer Entry.Chunks = [A指针, B指针, C指针]   // 不存 20MiB
+```
+
+关键写路径：`weed/operation/upload_chunked.go`（先上传再填 `FileChunk`）→ `putToFiler` 把 `chunkResult.FileChunks` 挂到 Entry。
+
+### 读取
+
+```text
+Lookup Entry.Chunks
+  → LookupFileId(fid) → volume URL
+  → GET volume/{fid} 读 Needle
+  → 按 Offset 拼响应
+```
+
+关键读路径：`weed/filer/stream.go` 的 `PrepareStreamContent*`。
+
+---
+
+## 6. 下一篇
+
+→ [03-assign-volume.mdx](./03-assign-volume.mdx)

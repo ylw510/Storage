@@ -1,0 +1,14 @@
+@keyframes mintPutDot {
+  from { left: 0%; }
+  to { left: calc(100% - 14px); }
+}
+
+@keyframes seqDotFwd {
+  from { left: 0%; }
+  to { left: calc(100% - 10px); }
+}
+
+@keyframes seqDotBack {
+  from { left: calc(100% - 10px); }
+  to { left: 0%; }
+}

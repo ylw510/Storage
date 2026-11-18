@@ -1,0 +1,349 @@
+---
+title: SeaweedFS 整体架构
+description: Master / Volume / Filer / S3 职责划分与一次读写的数据流
+sidebarTitle: 01 整体架构
+---
+
+export const ACTORS = ['Client', 'S3', 'Filer', 'Master', 'Volume']
+
+export const ACTOR_COLOR = {
+  Client: '#64748b',
+  S3: '#38bdf8',
+  Filer: '#fbbf24',
+  Master: '#e879f9',
+  Volume: '#4ade80',
+}
+
+export const PUT_SEQ = [
+  { from: 'Client', to: 'S3', dashed: false, label: '1 PUT /bucket/key', detail: 'S3 PutObjectHandler → putToFiler；按 MaxMB 切 chunk。', plane: 'api' },
+  { from: 'S3', to: 'Filer', dashed: false, label: '2 AssignVolume(path, size…)', detail: 'S3 经 WithFilerClient 调 Filer.AssignVolume（不是直连 Master）。', plane: 'ctrl' },
+  { from: 'Filer', to: 'Master', dashed: false, label: '3 Master.Assign', detail: 'Filer resolveAssignStorageOption 后 operation.Assign → Master PickForWrite。', plane: 'ctrl' },
+  { from: 'Master', to: 'Filer', dashed: true, label: '4 { fid, URL, replicas, Auth }', detail: 'Master 把写位点还给 Filer。', plane: 'ctrl' },
+  { from: 'Filer', to: 'S3', dashed: true, label: '5 AssignVolume 响应', detail: '同一 gRPC 返回给 S3；S3 此时才拿到 fid/URL。', plane: 'ctrl' },
+  { from: 'S3', to: 'Volume', dashed: false, label: '6 POST /{fid} 写 Needle', detail: 'UploadReaderInChunks：S3 HTTP 直写 Volume（不经 Filer/Master）。', plane: 'data' },
+  { from: 'S3', to: 'Filer', dashed: false, label: '7 CreateEntry(Chunks[])', detail: '全部 chunk 写完后，S3 调 Filer CreateEntry 只存索引。', plane: 'meta' },
+  { from: 'S3', to: 'Client', dashed: true, label: '8 200 OK', detail: 'Put 完成。每个 chunk 会重复步骤 2–6。', plane: 'api' },
+]
+
+export const DATA_SEQ = [
+  { from: 'S3', to: 'Filer', dashed: false, label: '1 AssignVolume', detail: '控制面入口在 Filer，不在 Master。', plane: 'ctrl' },
+  { from: 'Filer', to: 'Master', dashed: false, label: '2 Assign', detail: 'Filer 代为向 Master 要 fid。', plane: 'ctrl' },
+  { from: 'Master', to: 'Filer', dashed: true, label: '3 fid+URL', detail: 'Master 只发位置，不碰字节。', plane: 'ctrl' },
+  { from: 'Filer', to: 'S3', dashed: true, label: '4 回传写位点', detail: 'S3 拿到 Location 后才能写盘。', plane: 'ctrl' },
+  { from: 'S3', to: 'Volume', dashed: false, label: '5 POST Needle', detail: '数据面：S3→Volume；箭头越过 Filer/Master 生命线是对的。', plane: 'data' },
+  { from: 'S3', to: 'Volume', dashed: false, label: '6 下一 chunk 再写', detail: '每 chunk 再走一遍 Assign→写盘。', plane: 'data' },
+  { from: 'S3', to: 'Filer', dashed: false, label: '7 CreateEntry', detail: '元数据面：Chunks[] 指向已落盘 Needle。', plane: 'meta' },
+]
+
+export const PLANE_STYLE = {
+  api: { color: '#94a3b8', name: 'API' },
+  ctrl: { color: '#e879f9', name: '控制面' },
+  data: { color: '#38bdf8', name: '数据面' },
+  meta: { color: '#fbbf24', name: '元数据' },
+}
+
+export const SequencePlayer = ({ actors, steps, title }) => {
+  const [i, setI] = useState(0)
+  const [playing, setPlaying] = useState(false)
+  const step = steps[i]
+  const n = actors.length
+
+  useEffect(() => {
+    if (!playing) return
+    const t = setInterval(() => setI((p) => (p >= steps.length - 1 ? 0 : p + 1)), 1700)
+    return () => clearInterval(t)
+  }, [playing, steps.length])
+
+  const idx = (name) => actors.indexOf(name)
+
+  return (
+    <div
+      className="not-prose"
+      style={{
+        border: '1px solid #334155',
+        borderRadius: 12,
+        padding: 16,
+        background: '#0b1220',
+        color: '#e2e8f0',
+        maxWidth: 860,
+        marginBottom: 16,
+        overflowX: 'auto',
+      }}
+    >
+      <div style={{ display: 'flex', justifyContent: 'space-between', gap: 8, flexWrap: 'wrap', marginBottom: 12 }}>
+        <div style={{ fontSize: 13, color: '#94a3b8' }}>{title}</div>
+        <div style={{ fontSize: 12, color: '#64748b' }}>
+          <span style={{ color: '#e879f9' }}>● 控制面</span>
+          {'  '}
+          <span style={{ color: '#38bdf8' }}>● 数据面</span>
+          {'  '}
+          <span style={{ color: '#fbbf24' }}>● 元数据</span>
+        </div>
+      </div>
+
+      <div style={{ minWidth: 560 }}>
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(' + n + ', 1fr)', gap: 4, marginBottom: 4 }}>
+          {actors.map((a) => {
+            const on = a === step.from || a === step.to
+            return (
+              <div
+                key={a}
+                style={{
+                  textAlign: 'center',
+                  padding: '8px 4px',
+                  borderRadius: 8,
+                  border: '1.5px solid ' + (on ? ACTOR_COLOR[a] : '#334155'),
+                  background: on ? ACTOR_COLOR[a] + '22' : '#111827',
+                  color: on ? ACTOR_COLOR[a] : '#94a3b8',
+                  fontWeight: 700,
+                  fontSize: 13,
+                }}
+              >
+                {a}
+              </div>
+            )
+          })}
+        </div>
+
+        <div style={{ position: 'relative' }}>
+          <div
+            style={{
+              position: 'absolute',
+              inset: 0,
+              display: 'grid',
+              gridTemplateColumns: 'repeat(' + n + ', 1fr)',
+              pointerEvents: 'none',
+            }}
+          >
+            {actors.map((a) => (
+              <div key={a} style={{ display: 'flex', justifyContent: 'center' }}>
+                <div style={{ width: 0, borderLeft: '1px dashed #334155', height: '100%' }} />
+              </div>
+            ))}
+          </div>
+
+          <div style={{ position: 'relative', paddingTop: 8, paddingBottom: 8 }}>
+            {steps.map((msg, mi) => {
+              const a = idx(msg.from)
+              const b = idx(msg.to)
+              const left = Math.min(a, b)
+              const span = Math.abs(a - b) + 1
+              const visible = mi <= i
+              const current = mi === i
+              const self = a === b
+              const plane = PLANE_STYLE[msg.plane] || PLANE_STYLE.api
+              const arrow = msg.dashed ? '⤏' : '⟶'
+              const back = a > b
+
+              return (
+                <div
+                  key={msg.label + mi}
+                  style={{
+                    display: 'grid',
+                    gridTemplateColumns: 'repeat(' + n + ', 1fr)',
+                    minHeight: 44,
+                    opacity: visible ? 1 : 0.18,
+                    transform: current ? 'scale(1)' : 'scale(1)',
+                    transition: 'opacity .25s ease',
+                    marginBottom: 6,
+                  }}
+                >
+                  <div
+                    style={{
+                      gridColumn: self ? a + 1 + ' / span 1' : left + 1 + ' / span ' + span,
+                      display: 'flex',
+                      flexDirection: 'column',
+                      alignItems: self ? 'center' : 'stretch',
+                      justifyContent: 'center',
+                      padding: self ? '0 4px' : back ? '0 8px 0 4px' : '0 4px 0 8px',
+                    }}
+                  >
+                    <div
+                      style={{
+                        fontSize: 11,
+                        fontFamily: 'ui-monospace, monospace',
+                        color: current ? plane.color : '#94a3b8',
+                        fontWeight: current ? 700 : 500,
+                        marginBottom: 2,
+                        textAlign: back ? 'right' : 'left',
+                        whiteSpace: 'nowrap',
+                        overflow: 'hidden',
+                        textOverflow: 'ellipsis',
+                      }}
+                    >
+                      {msg.label}
+                    </div>
+                    {self ? (
+                      <div
+                        style={{
+                          border: '1.5px ' + (msg.dashed ? 'dashed ' : 'solid ') + (current ? plane.color : '#475569'),
+                          borderRadius: 8,
+                          height: 18,
+                          width: '70%',
+                          boxShadow: current ? '0 0 0 2px ' + plane.color + '44' : 'none',
+                        }}
+                      />
+                    ) : (
+                      <div
+                        style={{
+                          height: 2,
+                          background: current ? plane.color : '#475569',
+                          position: 'relative',
+                          borderTop: msg.dashed ? '2px dashed ' + (current ? plane.color : '#475569') : 'none',
+                          backgroundColor: msg.dashed ? 'transparent' : current ? plane.color : '#475569',
+                          boxShadow: current ? '0 0 8px ' + plane.color : 'none',
+                        }}
+                      >
+                        <span
+                          style={{
+                            position: 'absolute',
+                            top: -9,
+                            left: back ? -2 : 'auto',
+                            right: back ? 'auto' : -2,
+                            color: current ? plane.color : '#64748b',
+                            fontSize: 14,
+                            lineHeight: 1,
+                          }}
+                        >
+                          {back ? '◀' : '▶'}
+                        </span>
+                        {current && (
+                          <span
+                            key={i + '-dot'}
+                            className="seq-dot"
+                            style={{
+                              position: 'absolute',
+                              top: -4,
+                              width: 10,
+                              height: 10,
+                              borderRadius: '50%',
+                              background: plane.color,
+                              animation: back ? 'seqDotBack 1.1s linear infinite' : 'seqDotFwd 1.1s linear infinite',
+                            }}
+                          />
+                        )}
+                      </div>
+                    )}
+                  </div>
+                </div>
+              )
+            })}
+          </div>
+        </div>
+      </div>
+
+      <div
+        style={{
+          background: '#111827',
+          borderRadius: 10,
+          padding: 12,
+          marginTop: 8,
+          marginBottom: 12,
+          border: '1px solid #334155',
+        }}
+      >
+        <div style={{ fontSize: 12, color: '#94a3b8', marginBottom: 4 }}>
+          消息 {i + 1}/{steps.length} ·{' '}
+          <strong style={{ color: (PLANE_STYLE[step.plane] || PLANE_STYLE.api).color }}>
+            {(PLANE_STYLE[step.plane] || PLANE_STYLE.api).name}
+          </strong>
+          {' · '}
+          <span style={{ color: ACTOR_COLOR[step.from] }}>{step.from}</span>
+          {' → '}
+          <span style={{ color: ACTOR_COLOR[step.to] }}>{step.to}</span>
+        </div>
+        <div style={{ fontSize: 14, lineHeight: 1.55 }}>{step.detail}</div>
+      </div>
+
+      <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+        <button type="button" onClick={() => { setPlaying(false); setI(0) }} style={btnStyle}>重置</button>
+        <button type="button" onClick={() => { setPlaying(false); setI((v) => Math.max(0, v - 1)) }} style={btnStyle}>上一步</button>
+        <button type="button" onClick={() => setPlaying((p) => !p)} style={btnPrimary}>{playing ? '暂停' : '自动播放'}</button>
+        <button type="button" onClick={() => { setPlaying(false); setI((v) => Math.min(steps.length - 1, v + 1)) }} style={btnStyle}>下一步</button>
+      </div>
+    </div>
+  )
+}
+
+export const btnStyle = {
+  padding: '6px 12px',
+  borderRadius: 8,
+  cursor: 'pointer',
+  background: '#1e293b',
+  color: '#e2e8f0',
+  border: '1px solid #475569',
+}
+
+export const btnPrimary = {
+  padding: '6px 12px',
+  borderRadius: 8,
+  cursor: 'pointer',
+  background: '#1f6f8b',
+  color: '#fff',
+  border: 'none',
+}
+
+export const PutFlowPlayer = () => (
+  <SequencePlayer actors={ACTORS} steps={PUT_SEQ} title="Put 时序图 · 消息逐步显现（点「自动播放」或「下一步」）" />
+)
+
+export const DataPlaneFlow = () => (
+  <SequencePlayer
+    actors={ACTORS}
+    steps={DATA_SEQ}
+    title="控制面 vs 数据面（S3 Put）：Assign 走 Filer/Master，字节 S3→Volume"
+  />
+)
+
+# SeaweedFS 整体架构
+
+> **阅读目标**：分清四个角色——**Master 发位置、Volume 存数据、Filer 管路径、S3 讲对象语义**。
+
+预览：[http://localhost:3001/seaweedfs/01-overview](http://localhost:3001/seaweedfs/01-overview)（编辑器里看源码不会执行 React）。
+
+---
+
+## 1. 组件职责
+
+| 组件 | 职责 | 不负责 |
+|------|------|--------|
+| **Master** | 拓扑、可写 volume、发 **fid**、触发 volume 增长 | 对象路径、文件内容 |
+| **Volume** | 按 fid 追加/读取 **Needle** | 文件名、目录树 |
+| **Filer** | 路径 → Entry；Entry 上挂 **Chunks[]** | 大对象字节本身（通常） |
+| **S3 Gateway** | S3 API（Put/Get/Multipart…） | 底层选盘细节（委托 Filer/Master） |
+
+---
+
+## 2. 一次简单 Put 的数据流
+
+动态时序图（生命线 + 消息箭头，逐步播放）：
+
+<PutFlowPlayer />
+
+### Master / Filer / Volume：数据处理流
+
+同一风格。注意：**S3 调 Filer 要位点，但写 Needle 是 S3 直连 Volume**（源码 `UploadReaderInChunks` → `http://{volume}/{fid}`）。
+
+<DataPlaneFlow />
+
+读路径对称：
+
+```text
+S3 Get → Filer Lookup Entry.Chunks
+       → LookupFileId(fid) → volume URL
+       → Volume 读 Needle
+       → S3 按 Offset 拼响应
+```
+
+---
+
+## 3. 和纠删码笔记的关系
+
+- 普通副本写路径：本文档链（Needle + 副本）
+- EC（纠删码）：见 [Reed-Solomon 纠删码原理](/reed-solomon-principles)；SeaweedFS EC 是 volume/shard 层另一条路径，与「小文件 Needle 聚合」互补。
+
+---
+
+## 4. 下一篇
+
+→ [Needle、Chunk 与 Fid](/seaweedfs/02-needle-and-chunk)

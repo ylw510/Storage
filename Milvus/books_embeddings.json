@@ -1,0 +1,251 @@
+{
+  "model": "sentence-transformers/all-MiniLM-L6-v2",
+  "pipeline": "sentence-transformers/all-MiniLM-L6-v2 (normalize) \u2192 PCA(2, random_state=42) \u2192 L2 Normalizer",
+  "note": "Docs use embedding (2-d PCA). embedding_full_* is the raw MiniLM vector.",
+  "query_text": "Milvus HNSW vector search",
+  "query_embedding": [
+    0.7283,
+    0.6853
+  ],
+  "explained_variance_ratio": [
+    0.1965,
+    0.1697
+  ],
+  "books": [
+    {
+      "id": 1,
+      "title": "Milvus Internals",
+      "category": "tech",
+      "year": 2024,
+      "embedding": [
+        0.0724,
+        0.9974
+      ],
+      "embedding_full_dim": 384,
+      "embedding_full_head": [
+        -0.0472,
+        -0.0197,
+        0.0395,
+        0.048,
+        0.0112,
+        -0.0703,
+        0.1088,
+        0.0859
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Vector Search",
+      "category": "tech",
+      "year": 2023,
+      "embedding": [
+        0.9666,
+        -0.2564
+      ],
+      "embedding_full_dim": 384,
+      "embedding_full_head": [
+        -0.0206,
+        0.0286,
+        -0.0237,
+        -0.0484,
+        0.0413,
+        -0.0135,
+        0.0154,
+        -0.0691
+      ]
+    },
+    {
+      "id": 3,
+      "title": "The Great Novel",
+      "category": "fiction",
+      "year": 2020,
+      "embedding": [
+        -0.9253,
+        -0.3792
+      ],
+      "embedding_full_dim": 384,
+      "embedding_full_head": [
+        -0.0098,
+        0.0466,
+        0.0139,
+        0.0319,
+        -0.0413,
+        0.0781,
+        -0.0012,
+        0.0401
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Database Systems",
+      "category": "tech",
+      "year": 2022,
+      "embedding": [
+        0.9908,
+        0.1352
+      ],
+      "embedding_full_dim": 384,
+      "embedding_full_head": [
+        0.0048,
+        -0.0087,
+        -0.074,
+        -0.0249,
+        -0.0912,
+        -0.0302,
+        0.076,
+        0.0466
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Poetry of Spring",
+      "category": "fiction",
+      "year": 2021,
+      "embedding": [
+        -0.9686,
+        -0.2485
+      ],
+      "embedding_full_dim": 384,
+      "embedding_full_head": [
+        -0.0129,
+        0.0163,
+        0.0282,
+        -0.0036,
+        0.0571,
+        0.0754,
+        0.075,
+        -0.0964
+      ]
+    },
+    {
+      "id": 6,
+      "title": "HNSW Paper",
+      "category": "tech",
+      "year": 2016,
+      "embedding": [
+        -0.6759,
+        0.737
+      ],
+      "embedding_full_dim": 384,
+      "embedding_full_head": [
+        -0.1345,
+        0.0669,
+        -0.0341,
+        0.0333,
+        -0.021,
+        0.009,
+        -0.0017,
+        0.0105
+      ]
+    },
+    {
+      "id": 7,
+      "title": "Mystery Island",
+      "category": "fiction",
+      "year": 2019,
+      "embedding": [
+        -0.0369,
+        -0.9993
+      ],
+      "embedding_full_dim": 384,
+      "embedding_full_head": [
+        -0.0105,
+        0.0254,
+        -0.045,
+        0.0488,
+        0.0085,
+        -0.0365,
+        0.0527,
+        -0.0672
+      ]
+    },
+    {
+      "id": 8,
+      "title": "Knowhere Guide",
+      "category": "tech",
+      "year": 2025,
+      "embedding": [
+        0.4056,
+        -0.9141
+      ],
+      "embedding_full_dim": 384,
+      "embedding_full_head": [
+        0.0686,
+        0.0388,
+        -0.0534,
+        0.0341,
+        0.0046,
+        0.0194,
+        -0.0078,
+        -0.0134
+      ]
+    }
+  ],
+  "l2_to_query": [
+    {
+      "id": 4,
+      "l2": 0.6095,
+      "category": "tech",
+      "title": "Database Systems"
+    },
+    {
+      "id": 1,
+      "l2": 0.7264,
+      "category": "tech",
+      "title": "Milvus Internals"
+    },
+    {
+      "id": 2,
+      "l2": 0.9714,
+      "category": "tech",
+      "title": "Vector Search"
+    },
+    {
+      "id": 6,
+      "l2": 1.4052,
+      "category": "tech",
+      "title": "HNSW Paper"
+    },
+    {
+      "id": 8,
+      "l2": 1.6316,
+      "category": "tech",
+      "title": "Knowhere Guide"
+    },
+    {
+      "id": 7,
+      "l2": 1.8502,
+      "category": "fiction",
+      "title": "Mystery Island"
+    },
+    {
+      "id": 5,
+      "l2": 1.9369,
+      "category": "fiction",
+      "title": "Poetry of Spring"
+    },
+    {
+      "id": 3,
+      "l2": 1.9666,
+      "category": "fiction",
+      "title": "The Great Novel"
+    }
+  ],
+  "search_filter_tech_delete_4_top3": [
+    {
+      "id": 1,
+      "l2": 0.7264,
+      "title": "Milvus Internals"
+    },
+    {
+      "id": 2,
+      "l2": 0.9714,
+      "title": "Vector Search"
+    },
+    {
+      "id": 6,
+      "l2": 1.4052,
+      "title": "HNSW Paper"
+    }
+  ]
+}

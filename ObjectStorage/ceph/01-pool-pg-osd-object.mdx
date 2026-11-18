@@ -1,0 +1,219 @@
+---
+title: Pool、PG、OSD、Object 的关系
+description: 用云盘（RBD）业务场景串起 Ceph 四层数据模型
+---
+
+# Pool、PG、OSD、Object 的关系
+
+用一个**云盘（RBD 块存储）**业务场景，把 Ceph 四层概念串起来。
+
+## 业务背景
+
+某 SaaS 公司做在线设计工具，用户把设计稿存成虚拟磁盘：
+
+- **产品**：每个用户一块 100GB 云盘
+- **后端**：Ceph 集群，3 副本，保证单盘故障数据不丢
+- **集群**：12 台存储节点，每台跑 1 个 **OSD**（共 12 个 OSD）
+
+---
+
+## 四个概念分别扮演什么角色
+
+```
+Pool（资源池）      →  业务 / 策略边界："云盘数据放这里，3 副本"
+Object（对象）     →  实际存的数据块：4MB 一块
+PG（放置组）       →  中间分组：把海量 Object 打成组，方便管副本
+OSD（存储守护进程） →  真正写磁盘的工人
+```
+
+| 概念 | 业务类比 | 一句话 |
+|------|----------|--------|
+| **Pool** | 仓库分区 | 哪类业务、几副本、多少 PG |
+| **Object** | 包裹 | 实际存的那 4MB 数据 |
+| **PG** | 班组 | 把海量包裹分组，统一管副本和恢复 |
+| **OSD** | 货架 / 工人 | 真正存数据的那台机器 |
+
+**数据流：** 用户写云盘 → **Object** → 进某个 **PG** → **PG** 决定在哪些 **OSD** 上存 3 份；这一切都在同一个 **Pool** 的规则下完成。
+
+---
+
+## 第 1 步：建 Pool —— 划定「云盘业务区」
+
+运维创建 pool：
+
+```bash
+ceph osd pool create rbd_pool 128 128   # 128 个 PG
+ceph osd pool set rbd_pool size 3        # 3 副本
+```
+
+**Pool = `rbd_pool`**，含义：
+
+- 所有云盘数据都进这个 pool
+- 统一 3 副本策略
+- 内部切分成 **128 个 PG**（如 `1.0`、`1.1` … `1.127`，`1` 是 pool id）
+
+类比：**一个仓库分区**，规定「这里放云盘货，每件货要备份 3 份」。
+
+---
+
+## 第 2 步：用户写云盘 —— 产生 Object
+
+用户 `alice` 的云盘写入 4MB 数据，Ceph 拆成 RADOS Object，例如：
+
+```
+object: rbd_data.a1b2c3d4.00000042   （第 42 个 4MB 块）
+大小: 4MB
+```
+
+**Object = 最小存储单元**。用户不直接感知，RBD 层自动拆分。
+
+类比：**一箱货里的一个包裹**。
+
+---
+
+## 第 3 步：Object → PG —— 先分组
+
+Ceph 计算：
+
+```
+hash("rbd_data.a1b2c3d4.00000042") % 128  →  PG 1.37
+```
+
+这个 object 归 **PG 1.37** 管。
+
+同一 PG 里还有成千上万个别的 object（别的用户、别的 offset），它们**共用同一套副本管理逻辑**（Peering、Recovery、Scrub 都在 PG 粒度进行）。
+
+类比：**包裹先分到 37 号班组**，班组统一管这一批货的收发、盘点、补货。
+
+---
+
+## 第 4 步：PG → OSD —— 决定放哪几台机器
+
+CRUSH 为 PG 1.37 选出 3 个 OSD：
+
+```
+PG 1.37  →  [ osd.2 (primary), osd.7, osd.11 ]
+```
+
+- **osd.2**：主副本（primary），负责协调读写
+- **osd.7、osd.11**：从副本（replica），各存一份
+
+Object 写入时，**同 PG 的其他 object 也在这 3 台 OSD 上**，只是路径不同。
+
+类比：**37 号班组的货，固定放在 2、7、11 三个货架**，每个货架一份。
+
+---
+
+## 第 5 步：一次完整写入链路
+
+```
+用户写 4MB
+  → RBD 层拆成 1 个 Object
+  → Object 映射到 PG 1.37
+  → Client 连 primary osd.2 写
+  → osd.2 同步复制到 osd.7、osd.11
+  → 3 份落盘，写完成
+```
+
+---
+
+## 同一业务里的其他情况
+
+### 用户 bob 也在写云盘
+
+```
+object: rbd_data.x9y8z7w6.00000001  →  PG 1.5   →  [osd.4, osd.9, osd.1]
+object: rbd_data.a1b2c3d4.00000043  →  PG 1.37  →  [osd.2, osd.7, osd.11]
+```
+
+- **Pool 相同**（都在 `rbd_pool`）
+- **PG 不同** → 落在不同 OSD 组 → **负载分散**
+- **Object 不同** → 各自 4MB 数据
+
+alice 的第 42、43 块若 hash 到同一 PG，则由同一组 OSD 管理副本关系。
+
+### osd.7 硬盘坏了
+
+只影响「副本里有 osd.7」的那些 **PG**（如 PG 1.37）：
+
+```
+PG 1.37: active + degraded   （只剩 2 副本，还能读写）
+         → recovery 把缺失副本补到新 OSD
+         → 恢复后: active + clean
+```
+
+运维在 `ceph -s` 里看的是 **PG 状态**，不是逐个 object 排查。
+
+### 集群扩容，加了 4 台新 OSD
+
+部分 **PG 迁移**到新 OSD（backfill）：
+
+```
+PG 1.37 原来: [osd.2, osd.7, osd.11]
+迁移后可能:   [osd.2, osd.14, osd.11]   （osd.7 的数据迁到 osd.14）
+```
+
+**Object 不用改名字**，只变 PG 的 OSD 映射；RBD 用户无感知。
+
+---
+
+## 总览图
+
+```
+┌─────────────────────────────────────────────────────────┐
+│  Pool: rbd_pool  (3 副本, 128 PG)                        │
+│  ┌─────────┐  ┌─────────┐  ┌─────────┐       ┌─────────┐│
+│  │ PG 1.5  │  │ PG 1.37 │  │ PG 1.82 │  ...  │PG 1.127 ││
+│  │ obj×N   │  │ obj×N   │  │ obj×N   │       │ obj×N   ││
+│  └───┬─────┘  └───┬─────┘  └───┬─────┘       └─────────┘│
+└──────┼────────────┼────────────┼────────────────────────┘
+       │ CRUSH      │ CRUSH      │ CRUSH
+       ▼            ▼            ▼
+   osd.4,9,1   osd.2,7,11   osd.3,8,10  ...     (12 台 OSD)
+       │            │            │
+       ▼            ▼            ▼
+    物理磁盘      物理磁盘      物理磁盘
+```
+
+---
+
+## 映射规则速查
+
+| 关系 | 规则 |
+|------|------|
+| Object → PG | **多对一**：很多 object 映射到同一个 PG |
+| Object → PG | **每个 object 只属于一个 PG** |
+| PG → OSD | **一对多**：一个 PG 对应一个 OSD 列表（1 primary + N replica） |
+| PG → OSD | **多对一**：很多 PG 可以落在同一个 OSD 上 |
+| PG → Pool | **每个 PG 只属于一个 pool** |
+
+简化伪代码（来自 Ceph 开发文档）：
+
+```python
+obj_hash = hash(object_name)
+pg = obj_hash % num_pg                    # 对象 → PG
+osds_for_pg = crush(pg)                   # PG → OSD 列表
+primary = osds_for_pg[0]
+replicas = osds_for_pg[1:]
+```
+
+PG **不代表固定大小的存储空间**，只代表约 `1/pg_num` 的数据份额；真正决定落在哪些物理 OSD 上的是 **CRUSH**（权重、机架、故障域等）。
+
+---
+
+## 和其他概念的区别
+
+| 概念 | 区别 |
+|------|------|
+| **Pool** | 逻辑隔离（权限、副本数、EC 策略）；PG 是 Pool 内部的子集 |
+| **OSD** | 物理 / 进程级存储节点；一个 OSD 承载很多 PG |
+| **Object** | 最小存储单元；通过 PG 间接放置 |
+| **CRUSH Rule** | 决定 PG 如何映射到 OSD 的规则；PG 是 CRUSH 的输入 |
+
+---
+
+## 参考
+
+- Ceph 官方文档：[Placement Groups](https://docs.ceph.com/en/latest/rados/operations/placement-groups/)
+- 源码笔记：`/root/work/ceph/doc/dev/placement-group.rst`
+- OSD 运行时实体：`/root/work/ceph/src/osd/PG.h`

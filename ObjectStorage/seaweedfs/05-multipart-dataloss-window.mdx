@@ -1,0 +1,65 @@
+---
+title: Multipart Complete 数据丢失窗口
+description: Issue #10663：对象已发布但 .uploads 残留时，s3.clean.uploads 误删 Needle
+sidebarTitle: 05 Complete 丢失窗口
+---
+
+# Multipart Complete 数据丢失窗口
+
+> **阅读目标**：理解 #10663 的因果链与两类修复（cleaner 兜底 / Complete 事务化）。  
+> Issue：https://github.com/seaweedfs/seaweedfs/issues/10663
+
+---
+
+## 1. 根因（三事实）
+
+1. Complete **引用** part 的 fid，不拷贝字节。  
+2. 因此删 `.uploads/<id>` 必须 **`IsDeleteData=false`**。当前该删除在对象 **已 commit 之后** best-effort，失败只打 `V(1)`。  
+3. `s3.clean.uploads` 对过期 `.uploads` 做递归删除且 **默认删 chunk** → 误伤 live 对象的 Needle。
+
+表现：HEAD 仍有 Content-Length，vacuum 后 GET 空/不完整。
+
+---
+
+## 2. 窗口形态
+
+```text
+[写 version / 对象成功] ----窗口---- [metadata-only 删 .uploads]
+                         ↑
+              crash / filer 错误 / 进程被杀
+                         ↓
+              .uploads 残留 + 对象已可读
+                         ↓
+              s3.clean.uploads（默认带数据）→ Needle 被删
+```
+
+---
+
+## 3. 修复方向
+
+| 方案 | 思路 | 作用 |
+|------|------|------|
+| **A（兜底）** | purge 前查 `SeaweedFSUploadId`；已 commit → metadata-only | 挡住 cleaner 误删 |
+| **B（主路径）** | `ObjectTransaction`：`PUT 对象 → DELETE .uploads(meta) → RECOMPUTE_LATEST` | 收窄/消除「已发布仍留 upload 目录」窗口 |
+
+顺序约束（B）：
+
+- 必须先 PUT，再删 upload：否则中间 chunk 零引用，fsck 可能当真 orphan。  
+- DELETE 应在 RECOMPUTE 前：避免「已发布为 latest 但 `.uploads` 仍在」。
+
+`ObjectTransaction`：**有 per-path 锁、按序执行、失败不回滚** → 仍可能 partial；A 作为兜底仍有价值。
+
+---
+
+## 4. 源码锚点（master 现状）
+
+- Complete 后置 cleanup：`filer_multipart.go` 中 `rm(..., false, true)`  
+- Cleaner：`weed/shell/command_s3_clean_uploads.go`  
+- 事务基础设施：`FilerServer.ObjectTransaction`、`routedPut` / `objectTxnOnFiler`
+
+---
+
+## 5. 相关笔记
+
+- Multipart 主路径：[04-multipart-upload.mdx](./04-multipart-upload.mdx)  
+- Chunk/Needle 为何误删致命：[02-needle-and-chunk.mdx](./02-needle-and-chunk.mdx)

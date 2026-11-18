@@ -1,0 +1,39 @@
+{
+  "$schema": "https://mintlify.com/docs.json",
+  "theme": "mint",
+  "name": "ObjectStorage",
+  "description": "对象存储原理与 SeaweedFS 源码解读",
+  "colors": {
+    "primary": "#1f6f8b",
+    "light": "#3d9bb5",
+    "dark": "#154e63"
+  },
+  "navigation": {
+    "groups": [
+      {
+        "group": "开始",
+        "pages": ["index"]
+      },
+      {
+        "group": "纠删码",
+        "pages": ["reed-solomon-principles"]
+      },
+      {
+        "group": "SeaweedFS 源码解读",
+        "pages": [
+          "seaweedfs/01-overview",
+          "seaweedfs/02-needle-and-chunk",
+          "seaweedfs/03-assign-volume",
+          "seaweedfs/04-multipart-upload",
+          "seaweedfs/05-multipart-dataloss-window"
+        ]
+      },
+      {
+        "group": "Ceph",
+        "pages": [
+          "ceph/01-pool-pg-osd-object"
+        ]
+      }
+    ]
+  }
+}

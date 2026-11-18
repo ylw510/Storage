@@ -1,0 +1,79 @@
+---
+title: AssignVolume 原理
+description: Filer → Master：选可写 volume、生成 fid、返回写地址
+sidebarTitle: 03 AssignVolume
+---
+
+# AssignVolume 原理
+
+> **阅读目标**：写 Needle 之前如何拿到 **fid + volume URL**；Filer 与 Master 各做什么。
+
+---
+
+## 1. 为什么需要 Assign
+
+客户端不能自己发明「写到哪台机器、哪个 volume、哪个 needle id」。  
+**Assign** = 向集群申请一个合法写入位点。
+
+---
+
+## 2. 调用链
+
+```text
+putToFiler / UploadReaderInChunks
+  → FilerServer.AssignVolume
+  → operation.Assign → MasterServer.Assign
+  → Topology.PickForWrite
+  → { Fid, Location, Replicas, Auth }
+  → POST Location/Fid 写入 Needle
+```
+
+---
+
+## 3. Filer：`AssignVolume`
+
+源码：`weed/server/filer_grpc_server.go`
+
+1. `resolveAssignStorageOption`：按 `Path` 等解析 collection / replication / TTL / disk（filer.conf）
+2. `ToAssignRequests` 转成 Master 请求
+3. 调用 Master，返回 `FileId`、主/副本 `Location`、JWT `Auth`
+
+Filer **不生成** fid。
+
+---
+
+## 4. Master：`Assign`
+
+源码：`weed/server/master_grpc_server_assign.go`
+
+1. 仅 **leader** 可 Assign；拓扑需已 warmup  
+2. 按 collection + 副本策略 + TTL + disk 取 `VolumeLayout`  
+3. `PickForWrite` 选可写 volume；不够则触发 **volume growth** 并短重试  
+4. 返回 fid + URL + replicas + 写 volume 用的 JWT  
+
+---
+
+## 5. `PickForWrite` 两步
+
+源码：`weed/topology/volume_layout.go`、`topology.go`
+
+| 步 | 作用 |
+|----|------|
+| `VolumeLayout.PickForWrite` | 从 `writables` **按剩余空间加权**选 `volumeId`（可带 DC/Rack/Node 过滤） |
+| `Topology.PickForWrite` | `Sequence.NextFileId()` + `rand.Uint32()` cookie → `NewFileId(vid, key, cookie)`；并用 `ExpectedDataSize` 预记账，避免心跳间隙打爆同一 volume |
+
+无可用 volume 时 `shouldGrow=true`，Master 异步建卷。
+
+---
+
+## 6. 与 Multipart 的次数关系
+
+- Create / Complete：通常 **不** Assign（Complete 复用已有 fid）  
+- 每个 UploadPart（或 PutObject）chunk：约 **1 次 Assign**  
+- 整对象约 \(\lceil \text{size} / \text{MaxMB} \rceil\) 次  
+
+---
+
+## 7. 下一篇
+
+→ [04-multipart-upload.mdx](./04-multipart-upload.mdx)

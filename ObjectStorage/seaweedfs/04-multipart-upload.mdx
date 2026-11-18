@@ -1,0 +1,98 @@
+---
+title: S3 Multipart 上传路径
+description: .uploads、.part、Create / UploadPart / Complete / Abort 与 Chunk 复用
+sidebarTitle: 04 Multipart
+---
+
+# S3 Multipart 上传路径
+
+> **阅读目标**：分片上传如何落到 `.uploads`；Part 与 Chunk 谁切什么；Complete 如何复用 Needle。
+
+---
+
+## 1. API 入口
+
+| API | Handler（约） |
+|-----|----------------|
+| CreateMultipartUpload | `NewMultipartUploadHandler` → `createMultipartUpload` |
+| UploadPart | `PutObjectPartHandler` → `putToFiler` |
+| Complete | `CompleteMultipartUploadHandler` → `completeMultipartUpload` |
+| Abort | `AbortMultipartUploadHandler` → `abortMultipartUpload` |
+
+源码：`weed/s3api/s3api_object_handlers_multipart.go`、`filer_multipart.go`。
+
+---
+
+## 2. 目录布局
+
+```text
+/buckets/<bucket>/.uploads/<uploadId>/
+  Extended["key"] = 目标 object key   # ExtMultipartObjectKey
+  0001_<uuid>.part
+  0002_<uuid>.part
+```
+
+- `.uploads`：内部 staging，一般不当用户对象列出  
+- `uploadId`：常与 key 的 hash 绑定，防串路径  
+- part 文件名：`genPartUploadPath` → `%04d_%s.part`
+
+---
+
+## 3. 两层切分（勿混）
+
+| | **Part** | **Chunk** |
+|--|----------|-----------|
+| 谁切 | 客户端 / SDK | 服务端 `putToFiler`（`MaxMB`） |
+| 目的 | S3 并行/断点 | 避免 OOM、适配 volume |
+| 落点 | `.part` Entry | Entry.Chunks[] → Needle |
+
+一个 32MiB Part、`MaxMB=8` → 一个 `.part` Entry 上 **4 个 Chunk / 4 个 Needle**。
+
+---
+
+## 4. UploadPart 如何落到 `.part`
+
+```text
+校验 upload 存在 + uploadId↔key
+  → 继承 Create 时的 SSE 等到 request
+  → filePath = .uploads/<id>/0001_<uuid>.part
+  → putToFiler(..., lifecycleTTLSec=0)   # part 不继承对象 Expiration TTL
+  → Assign × N → 写 Needle → CreateEntry(.part)
+  → checkUploadStillOpen（防 Abort 竞态）
+  → 返回 ETag
+```
+
+---
+
+## 5. Complete（master 树现状）
+
+```text
+prepareMultipartCompletionState
+  （幂等：对象已有相同 SeaweedFSUploadId 则直接返回）
+  → 按 versioning 写最终对象 Entry（Chunks = 各 part Chunks 拼接，不拷贝 Needle）
+  → 后置 cleanup：删多余 .part；rm .uploads/<id>（IsDeleteData=false）
+```
+
+Versioning：
+
+| 状态 | 写哪里 |
+|------|--------|
+| Enabled | `{key}.versions/<versionFile>` + RECOMPUTE_LATEST |
+| Suspended | 对象路径 + version=`null` |
+| 未配置 | 对象路径 |
+
+最终 Entry 常带：`SeaweedFSUploadId`、ETag、parts boundaries、SSE。
+
+---
+
+## 6. Abort vs Clean
+
+- **Abort**：删 upload 目录且 **删数据**（释放 Needle）  
+- **Complete cleanup**：删 upload 目录 **metadata-only**（Needle 留给正式对象）  
+- **`s3.clean.uploads`**：默认按过期 abandoned upload **带数据 purge** —— 若 Complete 后目录残留，可能误删 live Needle（见下一篇）
+
+---
+
+## 7. 下一篇
+
+→ [05-multipart-dataloss-window.mdx](./05-multipart-dataloss-window.mdx)

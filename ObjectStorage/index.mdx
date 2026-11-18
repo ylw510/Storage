@@ -1,0 +1,30 @@
+---
+title: ObjectStorage
+description: 对象存储相关原理与 SeaweedFS 源码解读笔记
+---
+
+# ObjectStorage
+
+对象存储相关原理与实现笔记。本地预览：
+
+```bash
+export PATH="/root/.npm-global/bin:$PATH"
+cd /root/Storage/ObjectStorage
+mint dev
+```
+
+打开 [http://localhost:3000](http://localhost:3000)。
+
+## 内容
+
+<CardGroup cols={2}>
+  <Card title="Reed-Solomon 纠删码" icon="puzzle-piece" href="/reed-solomon-principles">
+    有限域 → Vandermonde → 编解码与 EC 布局
+  </Card>
+  <Card title="SeaweedFS 源码解读" icon="diagram-project" href="/seaweedfs/01-overview">
+    Master / Filer / Volume / S3 与 Multipart 路径
+  </Card>
+  <Card title="Ceph：Pool / PG / OSD" icon="database" href="/ceph/01-pool-pg-osd-object">
+    云盘业务场景串起四层数据模型
+  </Card>
+</CardGroup>
